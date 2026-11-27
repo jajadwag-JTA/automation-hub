@@ -12,6 +12,6 @@ tags:
   - streamlit
   - excel
 links:
-  run: py -m streamlit run .\Phase18_Dashboard\phase18_dashboard.py
+  run: py -m streamlit run .\projects\sales-intelligence\app\Phase18_Dashboard\phase18_dashboard.py
   dashboard: http://localhost:8501
-  repo: https://github.com/jajadwag-JTA/sales-intelligence.git
+  repo: https://github.com/jajadwag-JTA/automation-hub/tree/main/projects/sales-intelligence
