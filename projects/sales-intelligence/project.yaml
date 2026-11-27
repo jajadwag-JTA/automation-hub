@@ -14,3 +14,4 @@ tags:
 links:
   run: py -m streamlit run .\Phase18_Dashboard\phase18_dashboard.py
   dashboard: http://localhost:8501
+  repo: https://github.com/jajadwag-JTA/sales-intelligence.git
