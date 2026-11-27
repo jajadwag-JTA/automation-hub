@@ -1,14 +1,5 @@
-# automation-hub
+﻿# Invoice sync
 
-One repository for all my automations. Each project has its own folder and documentation explaining what it does and how its pipeline works.
+Example project. Copies new invoices from the billing tool into the accounting sheet every morning.
 
-## Projects
-
-| Project | What it does | Status |
-|---|---|---|
-| (none yet) | | |
-
-## Secrets
-
-Real values stay in a `.env` file on each machine and are never committed.
-Only code and `.env.example` go to GitHub.
+Notes, decisions, where credentials live (never the secrets themselves), and known issues go here.
