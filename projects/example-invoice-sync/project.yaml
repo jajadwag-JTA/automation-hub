@@ -1,9 +1,0 @@
-slug: example-invoice-sync
-title: Invoice sync
-about: Copies new invoices from the billing tool into the accounting sheet every morning.
-kind: external        # managed = runs inside the hub; external = catalogue only
-status: live
-owner: you
-tags: [finance, daily]
-links:
-  repo: https://example.com/your/repo
