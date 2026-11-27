@@ -1,0 +1,9 @@
+trigger:
+  type: schedule
+  spec: "0 7 * * *"
+steps:
+  - {id: fetch,  name: Fetch new invoices, type: fetch,  system: Billing API,   next: [clean]}
+  - {id: clean,  name: Clean and dedupe,   type: transform, system: Script,     next: [write]}
+  - {id: write,  name: Append to sheet,    type: write,  system: Google Sheets, next: [notify]}
+  - {id: notify, name: Email summary,      type: notify, system: Email,         next: []}
+outputs: [Updated accounting sheet, Summary email]
