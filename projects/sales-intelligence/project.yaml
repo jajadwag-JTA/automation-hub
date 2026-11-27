@@ -1,0 +1,16 @@
+slug: sales-intelligence
+title: Sales Intelligence
+about: Turns sales workbooks into regional, selling-type and reconciliation reports, shown in a Streamlit dashboard for management.
+kind: external
+status: building
+owner: you
+tags:
+  - sales
+  - reconciliation
+  - dashboard
+  - python
+  - streamlit
+  - excel
+links:
+  run: py -m streamlit run .\Phase18_Dashboard\phase18_dashboard.py
+  dashboard: http://localhost:8501

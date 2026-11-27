@@ -1,0 +1,55 @@
+trigger:
+  type: manual
+  spec: Run the processing scripts and launch the dashboard by hand
+steps:
+  - id: load-source
+    name: Load source workbook
+    type: fetch
+    system: Excel + Pandas
+    next: [clean]
+    notes: Reads the Sell-in_RegionTownAreaCustomer sheet from the multi-year source workbook. Headers are on Excel row 8. Source and output paths are currently hardcoded Windows paths.
+  - id: clean
+    name: Clean numbers and text
+    type: transform
+    system: Pandas
+    next: [control-total]
+    notes: Converts the year columns to numbers (invalid values become 0) and tidies text fields. Invalid values are not logged yet.
+  - id: control-total
+    name: Extract official control total
+    type: transform
+    system: Pandas
+    next: [split-detail]
+    notes: Requires exactly one GRAND TOTAL row and uses it as the official annual total. Stops with an error if none or several are found.
+  - id: split-detail
+    name: Separate summary rows from detail
+    type: transform
+    system: Pandas
+    next: [analyse]
+    notes: Drops the LOCAL SALES TOTAL and GRAND TOTAL rows from the detail. Rows with a blank region are kept.
+  - id: analyse
+    name: Build summaries
+    type: transform
+    system: Pandas
+    next: [reconcile]
+    notes: Annual, regional, selling-type and stockist-completeness summaries. The source is aggregated, so stockist results are not a customer-level audit.
+  - id: reconcile
+    name: Reconcile detail to control total
+    type: decide
+    system: Pandas
+    next: [export]
+    notes: Compares the detail total with the control total for each year. PASS when the difference is under 1 currency unit. This is an arithmetic check, not an independent audit.
+  - id: export
+    name: Write Excel outputs
+    type: write
+    system: OpenPyXL
+    next: [dashboard]
+    notes: Writes the 12-sheet corrected intelligence workbook.
+  - id: dashboard
+    name: Review in the dashboard
+    type: manual
+    system: Streamlit + Plotly
+    next: []
+    notes: Launched by hand. Reads the existing Phase 16 and Phase 18C workbooks and does not rerun the engine. Phase 16 (transaction-level) stays separate from Phase 18.
+outputs:
+  - Corrected intelligence workbook (12 sheets)
+  - Streamlit management dashboard on localhost:8501
