@@ -1,4 +1,4 @@
-// Package server is the HTTP API: catalogue, projects, workflows, runs, schedules.
+// Package server is the HTTP API and the dashboard.
 package server
 
 import (
@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"hub/internal/projects"
+	"hub/web"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -18,8 +19,8 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// Run serves the API. Project folders are re-read on every request, so edits
-// to projects/ show up without a restart.
+// Run serves the API and the dashboard. Project folders are re-read on every
+// request, so edits to projects/ show up without a restart.
 func Run(listen, projectsDir string) error {
 	mux := http.NewServeMux()
 
@@ -61,6 +62,9 @@ func Run(listen, projectsDir string) error {
 		}
 		writeJSON(w, http.StatusOK, p.Workflow)
 	})
+
+	// The dashboard: everything that is not an API route.
+	mux.Handle("GET /", http.FileServer(http.FS(web.Static())))
 
 	// TODO: /api/runs, /api/schedules (all behind a bearer token)
 	return http.ListenAndServe(listen, mux)

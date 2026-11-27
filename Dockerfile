@@ -4,6 +4,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
+COPY web ./web
 RUN CGO_ENABLED=0 go build -trimpath -o /out/hub ./cmd/hub
 
 FROM gcr.io/distroless/static-debian12:nonroot
