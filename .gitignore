@@ -23,3 +23,6 @@ dist/
 
 # Logs
 *.log
+
+# Local run history and output
+data/

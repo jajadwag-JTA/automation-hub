@@ -1,10 +1,11 @@
-// Command hub is the automation hub: it serves the API and, later, the scheduler.
+// Command hub is the automation hub: it serves the API and dashboard and runs projects.
 package main
 
 import (
 	"fmt"
 	"os"
 
+	"hub/internal/runs"
 	"hub/internal/server"
 )
 
@@ -21,7 +22,16 @@ func main() {
 	if dir == "" {
 		dir = "projects"
 	}
-	if err := server.Run(listen, dir); err != nil {
+	data := os.Getenv("HUB_DATA_DIR")
+	if data == "" {
+		data = "data"
+	}
+	store, err := runs.Open(data)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := server.Run(listen, dir, store); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

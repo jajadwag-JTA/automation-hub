@@ -7,11 +7,20 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"hub/internal/workflows"
 )
+
+// RunSpec says how the hub runs a managed project. The command is a list, not
+// one string, so nothing is passed through a shell.
+type RunSpec struct {
+	Command []string `json:"command" yaml:"command"`
+	Dir     string   `json:"dir,omitempty" yaml:"dir"`
+	Timeout string   `json:"timeout,omitempty" yaml:"timeout"`
+}
 
 type Project struct {
 	Slug     string              `json:"slug" yaml:"slug"`
@@ -22,6 +31,7 @@ type Project struct {
 	Owner    string              `json:"owner" yaml:"owner"`
 	Tags     []string            `json:"tags" yaml:"tags"`
 	Links    map[string]string   `json:"links" yaml:"links"` // repo, dashboard, docs, ...
+	Run      *RunSpec            `json:"run,omitempty" yaml:"run"`
 	Readme   string              `json:"readme,omitempty" yaml:"-"`
 	Workflow *workflows.Workflow `json:"workflow,omitempty" yaml:"-"`
 }
@@ -78,6 +88,14 @@ func loadOne(path, folder string) (Project, error) {
 	if !validStatuses[p.Status] {
 		return p, fmt.Errorf("status %q must be idea, building, live, paused or retired", p.Status)
 	}
+	if p.Kind == "managed" && (p.Run == nil || len(p.Run.Command) == 0) {
+		return p, fmt.Errorf("a managed project needs run.command, a list like [py, script.py]")
+	}
+	if p.Run != nil && p.Run.Timeout != "" {
+		if _, err := time.ParseDuration(p.Run.Timeout); err != nil {
+			return p, fmt.Errorf("run.timeout %q must look like 30s, 5m or 1h", p.Run.Timeout)
+		}
+	}
 	if p.Tags == nil {
 		p.Tags = []string{}
 	}
@@ -107,5 +125,3 @@ func loadOne(path, folder string) (Project, error) {
 	}
 	return p, nil
 }
-
-// TODO: Sync(db) upserts these into Postgres so the repo stays the source of truth.

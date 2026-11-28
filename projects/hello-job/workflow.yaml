@@ -1,0 +1,18 @@
+trigger:
+  type: manual
+  spec: Press Run now in the dashboard
+steps:
+  - id: greet
+    name: Print a message
+    type: write
+    system: PowerShell
+    next: [wait]
+    notes: Writes a line to the run's output.
+  - id: wait
+    name: Wait two seconds
+    type: transform
+    system: PowerShell
+    next: []
+    notes: Lets you see the run in the running state before it finishes.
+outputs:
+  - A finished run in the run history

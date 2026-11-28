@@ -1,0 +1,15 @@
+slug: hello-job
+title: Hello job
+about: A harmless test job that prints two lines and waits two seconds. Use it to check that the hub can run things.
+kind: managed
+status: building
+owner: you
+tags:
+  - demo
+run:
+  command:
+    - powershell
+    - "-NoProfile"
+    - "-Command"
+    - "Write-Output 'Hello from the hub'; Start-Sleep -Seconds 2; Write-Output 'Done'"
+  timeout: 1m
