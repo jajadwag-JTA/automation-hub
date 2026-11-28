@@ -1,33 +1,47 @@
 "use strict";
+// Three screens, no repeats: Projects, one Project, and Activity.
+// Text from project files and run output is added as text, never as HTML.
+
 const $ = (s) => document.querySelector(s);
 const STATUSES = ["idea", "building", "live", "paused", "retired"];
 const KINDS = ["managed", "external"];
-const TABS = [["overview", "Overview"], ["projects", "Projects"], ["systems", "Systems"], ["triggers", "Triggers"]];
-const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const RUN_LABELS = { running: "running", succeeded: "succeeded", failed: "failed", timed_out: "timed out" };
+const PTABS = [["workflow", "Workflow"], ["runs", "Runs"], ["notes", "Notes"]];
 
 const state = {
-  data: [],
-  tab: "",
-  slug: "",
-  dtab: "overview",
-  filters: { q: "", status: "", kind: "", tag: "" },
-  sys: "",
-  trig: "all",
-  open: new Set(),
+  projects: [],
+  filters: { q: "", status: "", kind: "", tag: "", system: "" },
+  openSteps: new Set(),
+  starting: new Set(),
 };
 
-function el(tag, cls, text) {
+let visit = 0;       // changes on every navigation, so late replies are ignored
+let screen = null;   // { refresh() } for the screen on show
+let timer = 0;
+let lost = false;   // true while the hub cannot be reached
+
+/* ---------- helpers ---------- */
+
+function el(tag, cls, ...children) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
-  if (text !== undefined && text !== null) e.textContent = text;
+  for (const c of children) {
+    if (c !== undefined && c !== null && c !== false) e.append(c);
+  }
   return e;
 }
 
-function btn(text, cls, onclick) {
-  const b = el("button", cls, text);
+function button(cls, onClick, ...children) {
+  const b = el("button", cls, ...children);
   b.type = "button";
-  b.addEventListener("click", onclick);
+  b.addEventListener("click", onClick);
   return b;
+}
+
+function link(href, cls, ...children) {
+  const a = el("a", cls, ...children);
+  a.href = href;
+  return a;
 }
 
 function badge(text, status) {
@@ -36,656 +50,538 @@ function badge(text, status) {
   return b;
 }
 
-async function getJSON(url) {
-  const r = await fetch(url);
-  let body = null;
-  try { body = await r.json(); } catch (e) {}
-  if (!r.ok) throw new Error((body && body.error) || r.statusText);
+const plural = (n, word) => n + " " + word + (n === 1 ? "" : "s");
+const isWeb = (url) => /^https?:\/\//i.test(url);
+const isLocal = (url) => /^https?:\/\/(localhost|127\.0\.0\.1)/i.test(url);
+const canRun = (p) => !!(p.run && p.run.command && p.run.command.length);
+const stepsOf = (p) => (p.workflow && p.workflow.steps) || [];
+const systemsOf = (p) => [...new Set(stepsOf(p).map((s) => s.system).filter(Boolean))];
+
+function projectHref(slug, tab, runId) {
+  let h = "#project/" + encodeURIComponent(slug) + "/" + (tab || "workflow");
+  if (runId) h += "/" + encodeURIComponent(runId);
+  return h;
+}
+
+function when(iso) {
+  const d = new Date(iso);
+  const secs = Math.round((Date.now() - d.getTime()) / 1000);
+  if (secs < 60) return "just now";
+  if (secs < 3600) return plural(Math.floor(secs / 60), "minute") + " ago";
+  if (secs < 86400) return plural(Math.floor(secs / 3600), "hour") + " ago";
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+function exact(iso) {
+  return new Date(iso).toLocaleString();
+}
+
+function duration(run) {
+  const end = run.finished_at ? new Date(run.finished_at) : new Date();
+  const s = Math.max(0, (end - new Date(run.started_at)) / 1000);
+  if (s < 60) return s.toFixed(1) + " s";
+  return Math.floor(s / 60) + " min " + Math.round(s % 60) + " s";
+}
+
+const runBadge = (run) => badge(RUN_LABELS[run.status] || run.status, run.status);
+
+async function getJSON(url, options) {
+  const response = await fetch(url, Object.assign({ cache: "no-store" }, options));
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error((body && body.error) || response.statusText || "request failed");
   return body;
 }
 
-const pad = (n) => String(n).padStart(2, "0");
-
-function humanTrigger(t) {
-  if (!t) return "";
-  const spec = (t.spec || "").trim();
-  if (t.type === "schedule") {
-    let m = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(spec);
-    if (m) return "Daily at " + pad(m[2]) + ":" + pad(m[1]);
-    m = /^(\d{1,2}) (\d{1,2}) \* \* ([0-7])$/.exec(spec);
-    if (m) return DAYS[Number(m[3]) % 7] + "s at " + pad(m[2]) + ":" + pad(m[1]);
-  }
-  return spec;
+function showError(message) {
+  const box = $("#error");
+  box.textContent = message || "";
+  box.hidden = !message;
 }
 
-function sectionTitle(text) { return el("h3", "section", text); }
+async function loadProjects() {
+  state.projects = (await getJSON("/api/projects?full=1")) || [];
+}
 
-/* ---------- markdown (small, safe: builds DOM, never innerHTML) ---------- */
+/* ---------- running a project ---------- */
 
-function inline(parent, text) {
-  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/);
-  for (const part of parts) {
-    if (!part) continue;
-    if (part.length > 1 && part.startsWith("`") && part.endsWith("`")) {
-      parent.append(el("code", null, part.slice(1, -1)));
-    } else if (part.length > 3 && part.startsWith("**") && part.endsWith("**")) {
-      parent.append(el("strong", null, part.slice(2, -2)));
-    } else {
-      parent.append(document.createTextNode(part));
+async function startRun(slug) {
+  if (state.starting.has(slug)) return;
+  state.starting.add(slug);
+  showError("");
+  try {
+    const run = await getJSON("/api/projects/" + encodeURIComponent(slug) + "/run", {
+      method: "POST",
+      headers: { "X-Hub-Request": "1" },
+    });
+    const target = projectHref(slug, "runs", run.id);
+    if (location.hash === target) route();
+    else location.hash = target;
+  } catch (e) {
+    showError("Could not start the run: " + e.message);
+  } finally {
+    state.starting.delete(slug);
+  }
+}
+
+function runControl(p) {
+  if (!canRun(p)) {
+    const note = el("span", "muted small", "Catalogue only");
+    note.title = "Add a run: section to project.yaml so the hub can run it";
+    return note;
+  }
+  const running = p.last_run && p.last_run.status === "running";
+  const b = button("run-btn", () => { b.disabled = true; startRun(p.slug); }, running ? "Running…" : "Run now");
+  b.disabled = !!running;
+  return b;
+}
+
+/* ---------- Projects screen ---------- */
+
+function matches(p) {
+  const f = state.filters;
+  if (f.status && p.status !== f.status) return false;
+  if (f.kind && p.kind !== f.kind) return false;
+  if (f.tag && !(p.tags || []).includes(f.tag)) return false;
+  if (f.system && !systemsOf(p).includes(f.system)) return false;
+  const q = f.q.trim().toLowerCase();
+  if (!q) return true;
+  return [p.title, p.about, p.slug, (p.tags || []).join(" "), systemsOf(p).join(" ")].join(" ").toLowerCase().includes(q);
+}
+
+function select(label, allText, options, key, onChange) {
+  const s = el("select");
+  s.setAttribute("aria-label", label);
+  s.append(new Option(allText, ""));
+  const all = options.slice();
+  if (state.filters[key] && !all.includes(state.filters[key])) all.push(state.filters[key]);
+  for (const o of all) s.append(new Option(o, o));
+  s.value = state.filters[key];
+  s.addEventListener("change", () => { state.filters[key] = s.value; onChange(); });
+  return s;
+}
+
+function projectsScreen(view) {
+  const rows = el("div");
+  const found = el("div", "muted small found");
+  const unique = (fn) => [...new Set(state.projects.flatMap(fn))].sort();
+
+  function draw() {
+    const shown = state.projects.filter(matches);
+    found.textContent = shown.length + " of " + plural(state.projects.length, "project");
+    rows.replaceChildren();
+    if (!shown.length) {
+      rows.append(el("p", "muted", "No projects match. ", button("link", () => {
+        state.filters = { q: "", status: "", kind: "", tag: "", system: "" };
+        route();
+      }, "Clear filters")));
+      return;
+    }
+    rows.append(el("div", "prow head", el("span", null, "Project"), el("span", null, "Status"), el("span", null, "Last run"), el("span")));
+    for (const p of shown) {
+      const last = el("span", "lastrun");
+      if (p.last_run) {
+        const a = link(projectHref(p.slug, "runs", p.last_run.id), "runlink", runBadge(p.last_run),
+          el("span", "muted small", when(p.last_run.started_at)));
+        a.title = exact(p.last_run.started_at);
+        last.append(a);
+      } else {
+        last.append(el("span", "muted small", "Never run"));
+      }
+      const row = el("div", "prow clickable",
+        el("span", "ptitle", link(projectHref(p.slug), null, el("strong", null, p.title)), el("span", "muted small", p.about || "")),
+        el("span", null, badge(p.status, p.status)),
+        last,
+        el("span", "actions", runControl(p)));
+      row.addEventListener("click", (e) => {
+        if (!e.target.closest("a, button")) location.hash = projectHref(p.slug);
+      });
+      rows.append(row);
     }
   }
+
+  const search = el("input");
+  search.type = "search";
+  search.placeholder = "Search projects";
+  search.setAttribute("aria-label", "Search projects");
+  search.value = state.filters.q;
+  search.addEventListener("input", () => { state.filters.q = search.value; draw(); });
+
+  const controls = el("div", "controls", search,
+    select("Filter by status", "All statuses", STATUSES, "status", draw),
+    select("Filter by kind", "All kinds", KINDS, "kind", draw),
+    select("Filter by tag", "All tags", unique((p) => p.tags || []), "tag", draw),
+    select("Filter by system", "All systems", unique(systemsOf), "system", draw));
+
+  view.replaceChildren(el("div", "panel", controls, found, rows));
+  draw();
+
+  return {
+    async refresh() {
+      const mine = visit;
+      await loadProjects();
+      if (mine === visit) draw();
+    },
+    busy: () => state.projects.some((p) => p.last_run && p.last_run.status === "running"),
+  };
 }
 
-function renderMarkdown(src) {
+/* ---------- Project screen ---------- */
+
+function filterBy(key, value) {
+  state.filters = { q: "", status: "", kind: "", tag: "", system: "" };
+  state.filters[key] = value;
+  location.hash = "#projects";
+}
+
+function details(p) {
+  const meta = el("dl", "meta");
+  const add = (name, value) => meta.append(el("dt", null, name), el("dd", null, value));
+  const chipsFor = (key, values) => {
+    if (!values.length) return "-";
+    const box = el("div", "chips");
+    for (const v of values) {
+      const c = button("chip", () => filterBy(key, v), v);
+      c.title = "Show projects with this " + key;
+      box.append(c);
+    }
+    return box;
+  };
+
+  add("Owner", p.owner || "-");
+  add("Tags", chipsFor("tag", p.tags || []));
+  add("Systems", chipsFor("system", systemsOf(p)));
+
+  const links = el("div", "links");
+  for (const [name, url] of Object.entries(p.links || {})) {
+    if (isWeb(url)) {
+      const a = link(url, null, name + (isLocal(url) ? " (local)" : "") + " ↗");
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      if (isLocal(url)) a.title = "Opens only while it is running on this computer";
+      links.append(a);
+    } else {
+      const label = "Copy " + name + " command";
+      const b = button("copy", async () => {
+        try { await navigator.clipboard.writeText(url); b.textContent = "Copied"; }
+        catch (e) { b.textContent = "Copy failed"; }
+        setTimeout(() => { b.textContent = label; }, 1500);
+      }, label);
+      b.title = url;
+      links.append(b);
+    }
+  }
+  add("Links", links.childNodes.length ? links : "-");
+  if (canRun(p)) add("Runs", el("code", "cmd", p.run.command.join(" ")));
+  return meta;
+}
+
+function workflowTab(p) {
+  const w = p.workflow;
+  if (!w) return el("p", "muted", "No workflow yet. Add workflow.yaml to this project's folder, then refresh.");
+  const steps = stepsOf(p);
+  const nodes = {};
+  const names = Object.fromEntries(steps.map((s) => [s.id, s.name || s.id]));
+  const key = (id) => p.slug + ":" + id;
+
+  function setOpen(id, open) {
+    const n = nodes[id];
+    if (!n) return;
+    n.body.hidden = !open;
+    n.chev.textContent = open ? "▾" : "▸";
+    n.head.setAttribute("aria-expanded", String(open));
+    if (open) state.openSteps.add(key(id)); else state.openSteps.delete(key(id));
+  }
+
+  function jump(id) {
+    if (!nodes[id]) return;
+    setOpen(id, true);
+    const box = nodes[id].box;
+    box.scrollIntoView({ behavior: "smooth", block: "center" });
+    box.classList.add("flash");
+    setTimeout(() => box.classList.remove("flash"), 1200);
+  }
+
+  const flow = el("div", "flow", el("div", "node trigger",
+    el("div", "small muted", "Trigger"),
+    el("strong", null, w.trigger.type + (w.trigger.spec ? ": " + w.trigger.spec : "")),
+    w.trigger.type === "schedule" && el("div", "small muted", "The hub does not start scheduled runs yet.")));
+
+  for (const s of steps) {
+    const next = el("div", "small muted");
+    if (s.next && s.next.length) {
+      next.append("Next: ");
+      s.next.forEach((id, i) => {
+        if (i) next.append(", ");
+        next.append(button("link", () => jump(id), names[id] || id));
+      });
+    } else {
+      next.append("End of flow");
+    }
+    const body = el("div", "step-body", el("div", "small", s.notes || "No notes for this step."), next);
+    const chev = el("span", "chev");
+    const head = button("step-head", () => setOpen(s.id, body.hidden), chev,
+      el("span", "step-title", el("strong", null, s.name || s.id), el("span", "muted small", s.system || "")),
+      badge(s.type || "step"));
+    const box = el("div", "node", head, body);
+    nodes[s.id] = { box, head, body, chev };
+    setOpen(s.id, state.openSteps.has(key(s.id)));
+    flow.append(el("div", "arrow", "↓"), box);
+  }
+
+  if (w.outputs && w.outputs.length) {
+    const chips = el("div", "chips");
+    for (const x of w.outputs) chips.append(el("span", "chip", x));
+    flow.append(el("div", "arrow", "↓"), el("div", "node", el("div", "small muted", "Outputs"), chips));
+  }
+
+  return el("div", null,
+    el("div", "toolbar",
+      button("small-btn", () => steps.forEach((s) => setOpen(s.id, true)), "Expand all"),
+      button("small-btn", () => steps.forEach((s) => setOpen(s.id, false)), "Collapse all")),
+    flow);
+}
+
+// A list of runs where each one opens to show its output. Used by the Runs tab
+// and by Activity (which also names the project).
+function runList(showProject, openId, emptyText) {
+  const box = el("div", "runs");
+  const open = new Set(openId ? [openId] : []);
+  const outputs = new Map();
+  let runs = [];
+
+  function draw() {
+    const scrolls = new Map([...box.querySelectorAll("pre[data-run]")].map((x) =>
+      [x.dataset.run, { top: x.scrollTop, end: x.scrollTop + x.clientHeight >= x.scrollHeight - 4 }]));
+    box.replaceChildren();
+    if (!runs.length) { box.append(el("p", "muted", emptyText)); return; }
+    for (const r of runs) {
+      const isOpen = open.has(r.id);
+      const p = state.projects.find((x) => x.slug === r.project);
+      const head = button("run-head", async () => {
+        if (open.has(r.id)) open.delete(r.id); else open.add(r.id);
+        draw();
+        if (open.has(r.id)) { await fetchOutput(r.id); draw(); }
+      },
+        el("span", "chev", isOpen ? "▾" : "▸"),
+        el("span", "run-when", showProject && el("strong", null, p ? p.title : r.project), el("span", showProject ? "muted small" : null, exact(r.started_at))),
+        el("span", "muted small", duration(r)),
+        runBadge(r));
+      head.setAttribute("aria-expanded", String(isOpen));
+      const item = el("div", "node run", head);
+      let output = null;
+      if (isOpen) {
+        const detail = outputs.get(r.id);
+        const facts = [r.trigger + " run", r.exit_code !== undefined ? "exit code " + r.exit_code : ""].filter(Boolean).join(", ");
+        const body = el("div", "step-body", el("div", "small muted", facts));
+        if (r.error) body.append(el("div", "small bad", r.error));
+        output = el("pre", "output", !detail ? "Loading output…" : detail.output || (r.status === "running" ? "Waiting for output…" : "This run printed nothing."));
+        output.dataset.run = r.id;
+        body.append(output);
+        if (showProject && p) body.append(el("div", null, link(projectHref(p.slug, "runs", r.id), null, "Open project")));
+        item.append(body);
+      }
+      box.append(item);
+      if (output) {
+        const s = scrolls.get(r.id);
+        output.scrollTop = !s || s.end ? output.scrollHeight : s.top;
+      }
+    }
+  }
+
+  async function fetchOutput(id) {
+    try {
+      outputs.set(id, await getJSON("/api/runs/" + encodeURIComponent(id)));
+    } catch (e) {
+      outputs.set(id, { output: "Could not read the output: " + e.message, status: "failed" });
+    }
+  }
+
+  return {
+    node: box,
+    async update(list) {
+      runs = list;
+      await Promise.all(runs.filter((r) => open.has(r.id)).map((r) => {
+        const have = outputs.get(r.id);
+        return have && have.status !== "running" ? null : fetchOutput(r.id);
+      }));
+      draw();
+    },
+    busy: () => runs.some((r) => r.status === "running"),
+  };
+}
+
+function projectScreen(view, slug, tab, runId) {
+  const find = () => state.projects.find((x) => x.slug === slug);
+  const p = find();
+  const back = link("#projects", null, "← All projects");
+  if (!p) {
+    view.replaceChildren(el("div", "panel", back, el("p", "muted", "There is no project called " + slug + ".")));
+    return { refresh: async () => {}, busy: () => false };
+  }
+  const current = PTABS.some(([id]) => id === tab) ? tab : "workflow";
+  const action = el("span", "actions", runControl(p));
+
+  const tabs = el("div", "tabs");
+  tabs.setAttribute("role", "tablist");
+  for (const [id, label] of PTABS) {
+    const a = link(projectHref(p.slug, id), "tab" + (id === current ? " active" : ""), label);
+    a.setAttribute("role", "tab");
+    a.setAttribute("aria-selected", String(id === current));
+    tabs.append(a);
+  }
+
+  let list = null;
+  let body;
+  if (current === "workflow") body = workflowTab(p);
+  else if (current === "notes") body = p.readme ? markdown(p.readme) : el("p", "muted", "No notes yet. Add README.md to this project's folder, then refresh.");
+  else {
+    list = runList(false, runId, canRun(p)
+      ? "No runs yet. Press Run now to start one."
+      : "This project is catalogue only, so the hub has no runs for it.");
+    body = list.node;
+    list.node.append(el("p", "muted", "Loading runs…"));
+  }
+
+  view.replaceChildren(el("div", "panel", back,
+    el("div", "row title", el("h2", null, p.title), el("div", "chips", badge(p.status, p.status), badge(p.kind), action)),
+    el("p", "muted", p.about || ""),
+    details(p), tabs, body));
+
+  const screen = {
+    async refresh() {
+      const mine = visit;
+      await loadProjects();
+      const runs = list ? await getJSON("/api/runs?limit=50&project=" + encodeURIComponent(slug)) : null;
+      if (mine !== visit) return;
+      const fresh = find();
+      if (fresh) action.replaceChildren(runControl(fresh));
+      if (list) await list.update(runs);
+    },
+    busy: () => !!((list && list.busy()) || (find() && find().last_run && find().last_run.status === "running")),
+  };
+  return screen;
+}
+
+/* ---------- Activity screen ---------- */
+
+function activityScreen(view) {
+  const list = runList(true, "", "Nothing has run yet. Open Projects and press Run now.");
+  list.node.append(el("p", "muted", "Loading runs…"));
+  view.replaceChildren(el("div", "panel", el("h3", "section", "Latest runs"), list.node));
+  return {
+    async refresh() {
+      const mine = visit;
+      const runs = await getJSON("/api/runs?limit=50");
+      if (mine === visit) await list.update(runs);
+    },
+    busy: list.busy,
+  };
+}
+
+/* ---------- notes (a small, safe Markdown reader) ---------- */
+
+function inline(parent, text) {
+  for (const part of text.split(/(`[^`]+`|\*\*[^*]+\*\*)/)) {
+    if (part.length > 1 && part.startsWith("`") && part.endsWith("`")) parent.append(el("code", null, part.slice(1, -1)));
+    else if (part.length > 3 && part.startsWith("**") && part.endsWith("**")) parent.append(el("strong", null, part.slice(2, -2)));
+    else parent.append(part);
+  }
+  return parent;
+}
+
+function markdown(source) {
   const root = el("div", "md");
-  const lines = String(src).replace(/\r\n?/g, "\n").split("\n");
-  const isList = (l) => /^\s*([-*]|\d+\.)\s+/.test(l);
-  const isIndented = (l) => /^( {4}|\t)/.test(l);
-  const special = (l) => /^```/.test(l) || /^#{1,4}\s/.test(l) || isList(l) || isIndented(l);
+  const lines = String(source).replace(/\r\n?/g, "\n").split("\n");
+  const item = /^\s*([-*]|\d+\.)\s+/;
+  const indented = /^( {4}|\t)/;
+  const special = (l) => /^(```|#{1,4}\s)/.test(l) || item.test(l);
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
     if (!line.trim()) { i++; continue; }
-    if (/^```/.test(line)) {
-      const buf = [];
+    if (line.startsWith("```")) {
+      const code = [];
+      for (i++; i < lines.length && !lines[i].startsWith("```"); i++) code.push(lines[i]);
       i++;
-      while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
+      root.append(el("pre", null, code.join("\n")));
+    } else if (indented.test(line) && !item.test(line)) {
+      const code = [];
+      while (i < lines.length && indented.test(lines[i])) code.push(lines[i++].replace(indented, ""));
+      root.append(el("pre", null, code.join("\n")));
+    } else if (/^#{1,4}\s/.test(line)) {
+      root.append(inline(el(line.startsWith("# ") ? "h3" : "h4", "md-h"), line.replace(/^#+\s+/, "")));
       i++;
-      root.append(el("pre", null, buf.join("\n")));
-      continue;
+    } else if (item.test(line)) {
+      const ul = el(/^\s*\d/.test(line) ? "ol" : "ul", "md-list");
+      while (i < lines.length && item.test(lines[i])) ul.append(inline(el("li"), lines[i++].replace(item, "")));
+      root.append(ul);
+    } else {
+      const para = [line.trim()];
+      for (i++; i < lines.length && lines[i].trim() && !special(lines[i]); i++) para.push(lines[i].trim());
+      root.append(inline(el("p"), para.join(" ")));
     }
-    if (isIndented(line)) {
-      const buf = [];
-      while (i < lines.length && (isIndented(lines[i]) || (!lines[i].trim() && i + 1 < lines.length && isIndented(lines[i + 1])))) {
-        buf.push(lines[i].replace(/^( {4}|\t)/, ""));
-        i++;
-      }
-      root.append(el("pre", null, buf.join("\n")));
-      continue;
-    }
-    const h = /^(#{1,4})\s+(.*)$/.exec(line);
-    if (h) {
-      const e = el(h[1].length === 1 ? "h3" : "h4", "md-h");
-      inline(e, h[2]);
-      root.append(e);
-      i++;
-      continue;
-    }
-    if (isList(line)) {
-      const list = el(/^\s*\d+\./.test(line) ? "ol" : "ul", "md-list");
-      while (i < lines.length && isList(lines[i])) {
-        const li = el("li");
-        inline(li, lines[i].replace(/^\s*([-*]|\d+\.)\s+/, ""));
-        list.append(li);
-        i++;
-      }
-      root.append(list);
-      continue;
-    }
-    const buf = [];
-    while (i < lines.length && lines[i].trim() && !special(lines[i])) { buf.push(lines[i].trim()); i++; }
-    if (!buf.length) { buf.push(lines[i].trim()); i++; }
-    const p = el("p");
-    inline(p, buf.join(" "));
-    root.append(p);
   }
   return root;
 }
 
-/* ---------- data helpers ---------- */
-
-function applyFilters() {
-  const f = state.filters;
-  const q = f.q.trim().toLowerCase();
-  return state.data.filter((p) => {
-    if (f.status && p.status !== f.status) return false;
-    if (f.kind && p.kind !== f.kind) return false;
-    if (f.tag && !(p.tags || []).includes(f.tag)) return false;
-    if (!q) return true;
-    return [p.title, p.about, p.slug, (p.tags || []).join(" ")].join(" ").toLowerCase().includes(q);
-  });
-}
-
-function stepsOf(p) { return (p.workflow && p.workflow.steps) || []; }
-
-function systemsOf(p) {
-  const set = new Set();
-  for (const s of stepsOf(p)) if (s.system) set.add(s.system);
-  return [...set];
-}
-
-function systemIndex() {
-  const m = new Map();
-  for (const p of state.data) {
-    for (const s of stepsOf(p)) {
-      const name = s.system || "(unspecified)";
-      const e = m.get(name) || { name: name, steps: 0, projects: new Map() };
-      e.steps++;
-      e.projects.set(p.slug, p.title);
-      m.set(name, e);
-    }
-  }
-  return [...m.values()].sort((a, b) => b.projects.size - a.projects.size || a.name.localeCompare(b.name));
-}
-
-function triggerType(p) { return p.workflow ? p.workflow.trigger.type : "none"; }
-
-/* ---------- routing ---------- */
+/* ---------- routing and refresh ---------- */
 
 function parseHash() {
-  let h = "";
-  try { h = decodeURIComponent(location.hash.slice(1)); } catch (e) {}
-  const i = h.indexOf("/");
-  const head = i < 0 ? h : h.slice(0, i);
-  const rest = i < 0 ? "" : h.slice(i + 1);
-  if ((head === "tag" || head === "system") && rest) return { tab: head, slug: rest };
-  const tab = TABS.some((t) => t[0] === head) ? head : "overview";
-  return { tab: tab, slug: rest };
-}
-
-function go(hash) {
-  if (location.hash.slice(1) === hash) route();
-  else location.hash = hash;
-}
-
-function openProjects(extra) {
-  state.filters = Object.assign({ q: "", status: "", kind: "", tag: "" }, extra || {});
-  go("projects");
-}
-
-function route() {
-  const r = parseHash();
-  const view = $("#view");
-  const detailTab = r.tab === "tag" || r.tab === "system";
-  const changed = r.tab !== state.tab || !view.firstChild || (detailTab && r.slug !== state.slug);
-  state.tab = r.tab;
-  state.slug = r.slug;
-  if (changed) render();
-  else if (state.tab === "projects") { renderList(); renderDetail(); }
-}
-
-function render() {
-  const view = $("#view");
-  view.replaceChildren();
-  const navTab = state.tab === "tag" ? "projects" : state.tab === "system" ? "systems" : state.tab;
-  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === navTab));
-  $("#count").textContent = state.data.length + (state.data.length === 1 ? " project" : " projects");
-  const views = { overview: renderOverview, projects: renderProjects, systems: renderSystems, triggers: renderTriggers, tag: renderTag, system: renderSystem };
-  views[state.tab](view);
-}
-/* ---------- Overview tab ---------- */
-
-function statCard(label, value, onclick) {
-  const b = el("button", "card");
-  b.type = "button";
-  b.append(el("div", "num", String(value)), el("div", "muted small", label));
-  if (value === 0) {
-    b.disabled = true;
-    b.title = "Nothing here yet";
-    b.style.opacity = "0.5";
-    b.style.cursor = "default";
-    b.style.borderColor = "var(--line)";
-  } else {
-    b.addEventListener("click", onclick);
-  }
-  return b;
-}
-
-function renderOverview(view) {
-  const d = state.data;
-  const wrap = el("div", "panel stack");
-  const count = (fn) => d.filter(fn).length;
-
-  wrap.append(sectionTitle("Projects by status"));
-  const g1 = el("div", "cards");
-  g1.append(statCard("All projects", d.length, () => openProjects()));
-  for (const s of STATUSES) g1.append(statCard(s, count((p) => p.status === s), () => openProjects({ status: s })));
-  wrap.append(g1);
-
-  wrap.append(sectionTitle("Where they run"));
-  const g2 = el("div", "cards");
-  for (const k of KINDS) {
-    const label = k === "managed" ? "Managed (runs in the hub)" : "External (catalogued)";
-    g2.append(statCard(label, count((p) => p.kind === k), () => openProjects({ kind: k })));
-  }
-  wrap.append(g2);
-
-  wrap.append(sectionTitle("How they start"));
-  const tc = {};
-  for (const p of d) { const t = triggerType(p); tc[t] = (tc[t] || 0) + 1; }
-  const g3 = el("div", "cards");
-  for (const [t, n] of Object.entries(tc)) {
-    g3.append(statCard(t === "none" ? "No workflow yet" : t, n, () => { state.trig = t; go("triggers"); }));
-  }
-  wrap.append(g3);
-
-  wrap.append(sectionTitle("Tags"));
-  const tags = {};
-  for (const p of d) for (const t of p.tags || []) tags[t] = (tags[t] || 0) + 1;
-  const tagBox = el("div", "chips");
-  const tagKeys = Object.keys(tags).sort();
-  if (!tagKeys.length) tagBox.append(el("span", "muted small", "No tags yet."));
-  for (const t of tagKeys) tagBox.append(btn(t + " (" + tags[t] + ")", "chip", () => go("tag/" + encodeURIComponent(t))));
-  wrap.append(tagBox);
-
-  wrap.append(sectionTitle("Systems used"));
-  const sysBox = el("div", "chips");
-  const sys = systemIndex();
-  if (!sys.length) sysBox.append(el("span", "muted small", "No workflows yet."));
-  for (const s of sys.slice(0, 14)) sysBox.append(btn(s.name, "chip", () => go("system/" + encodeURIComponent(s.name))));
-  wrap.append(sysBox);
-
-  view.append(wrap);
-}
-
-/* ---------- Projects tab ---------- */
-
-function renderProjects(view) {
-  const cols = el("div", "cols");
-  const aside = el("aside", "panel");
-  const controls = el("div", "controls");
-
-  const q = el("input");
-  q.id = "q";
-  q.type = "search";
-  q.placeholder = "Search projects";
-  q.setAttribute("aria-label", "Search projects");
-  q.addEventListener("input", () => { state.filters.q = q.value; renderList(); });
-
-  const st = el("select");
-  st.id = "status";
-  st.setAttribute("aria-label", "Filter by status");
-  st.append(new Option("All statuses", ""));
-  for (const s of STATUSES) st.append(new Option(s, s));
-  st.addEventListener("change", () => { state.filters.status = st.value; renderList(); });
-
-  const kd = el("select");
-  kd.id = "kind";
-  kd.setAttribute("aria-label", "Filter by kind");
-  kd.append(new Option("All kinds", ""));
-  for (const k of KINDS) kd.append(new Option(k, k));
-  kd.addEventListener("change", () => { state.filters.kind = kd.value; renderList(); });
-
-  controls.append(q, st, kd);
-  const active = el("div", "chips");
-  active.id = "activefilter";
-  const ul = el("ul");
-  ul.id = "list";
-  aside.append(controls, active, ul);
-
-  const detail = el("section", "panel");
-  detail.id = "detail";
-  cols.append(aside, detail);
-  view.append(cols);
-  renderList();
-  renderDetail();
-}
-
-function renderList() {
-  const ul = $("#list");
-  if (!ul) return;
-  const f = state.filters;
-  const q = $("#q");
-  if (q.value !== f.q) q.value = f.q;
-  $("#status").value = f.status;
-  $("#kind").value = f.kind;
-
-  const af = $("#activefilter");
-  af.replaceChildren();
-  if (f.tag) {
-    const c = btn("tag: " + f.tag + "  \u00d7", "chip", () => { state.filters.tag = ""; renderList(); });
-    c.setAttribute("aria-label", "Clear tag filter " + f.tag);
-    af.append(c);
-  }
-
-  const shown = applyFilters();
-  $("#count").textContent = shown.length + " of " + state.data.length + (state.data.length === 1 ? " project" : " projects");
-  ul.replaceChildren();
-  if (!shown.length) { ul.append(el("li", "muted empty", "No projects match.")); return; }
-  for (const p of shown) {
-    const li = el("li");
-    const a = el("a", "item" + (p.slug === state.slug ? " active" : ""));
-    a.href = "#projects/" + encodeURIComponent(p.slug);
-    const top = el("div", "row");
-    top.append(el("strong", null, p.title), badge(p.status, p.status));
-    a.append(top, el("div", "muted small", p.about));
-    li.append(a);
-    ul.append(li);
-  }
-}
-
-function renderDetail() {
-  const d = $("#detail");
-  if (!d) return;
-  d.replaceChildren();
-  if (!state.slug) { d.append(el("p", "muted", "Select a project from the list.")); return; }
-  const p = state.data.find((x) => x.slug === state.slug);
-  if (!p) { d.append(el("p", "muted", "No project with slug \u201c" + state.slug + "\u201d.")); return; }
-
-  const head = el("div", "row");
-  head.append(el("h2", null, p.title));
-  const bs = el("div", "chips");
-  bs.append(badge(p.status, p.status), badge(p.kind));
-  head.append(bs);
-  d.append(head, el("p", "muted", p.about));
-
-  const defs = [
-    ["overview", "Overview", true],
-    ["workflow", "Workflow" + (p.workflow ? " (" + stepsOf(p).length + ")" : ""), !!p.workflow],
-    ["notes", "Notes", !!p.readme],
-  ];
-  if (!defs.some((x) => x[0] === state.dtab && x[2])) state.dtab = "overview";
-  const tabs = el("div", "tabs");
-  tabs.setAttribute("role", "tablist");
-  for (const [id, label, enabled] of defs) {
-    const b = btn(label, "tab" + (state.dtab === id ? " active" : ""), () => { state.dtab = id; renderDetail(); });
-    b.setAttribute("role", "tab");
-    b.setAttribute("aria-selected", String(state.dtab === id));
-    b.disabled = !enabled;
-    tabs.append(b);
-  }
-  d.append(tabs);
-
-  const body = el("div");
-  d.append(body);
-  if (state.dtab === "overview") renderProjectOverview(body, p);
-  else if (state.dtab === "workflow") renderWorkflow(body, p);
-  else body.append(renderMarkdown(p.readme));
-}
-
-function copyBtn(name, value) {
-  const label = "Copy " + name;
-  const b = btn(label, "copy", async () => {
-    try { await navigator.clipboard.writeText(value); b.textContent = "Copied"; }
-    catch (e) { b.textContent = "Copy failed"; }
-    setTimeout(() => { b.textContent = label; }, 1500);
+  const parts = location.hash.replace(/^#\/?/, "").split("/").map((x) => {
+    try { return decodeURIComponent(x); } catch (e) { return ""; }
   });
-  b.title = value;
-  return b;
+  if (parts[0] === "project" && parts[1]) return { page: "project", slug: parts[1], tab: parts[2], run: parts[3] };
+  return { page: parts[0] === "activity" ? "activity" : "projects" };
 }
 
-function renderProjectOverview(body, p) {
-  const meta = el("dl", "meta");
-  const row = (k, node) => {
-    const dd = el("dd");
-    dd.append(node);
-    meta.append(el("dt", null, k), dd);
-  };
-
-  row("Owner", document.createTextNode(p.owner || "-"));
-  row("Kind", document.createTextNode(p.kind === "managed" ? "Managed: runs inside the hub" : "External: catalogued here, runs elsewhere"));
-
-  const tags = el("div", "chips");
-  for (const t of p.tags || []) {
-    const c = btn(t, "chip", () => go("tag/" + encodeURIComponent(t)));
-    c.title = "See every project with this tag";
-    tags.append(c);
-  }
-  if (!tags.childNodes.length) tags.append(el("span", "muted", "-"));
-  row("Tags", tags);
-
-  const links = el("div", "links");
-  for (const [name, url] of Object.entries(p.links || {})) {
-    if (/^https?:\/\//i.test(url)) {
-      const local = /^https?:\/\/(localhost|127\.0\.0\.1)/i.test(url);
-      const a = el("a", null, local ? name + " (local)" : name);
-      if (local) a.title = "Opens only while it is running on this computer";
-      a.href = url;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      links.append(a);
-    } else {
-      links.append(copyBtn(name, url));
-    }
-  }
-  if (!links.childNodes.length) links.append(el("span", "muted", "-"));
-  row("Links", links);
-
-  if (p.workflow) {
-    const trig = el("div");
-    trig.append(badge(p.workflow.trigger.type), document.createTextNode("  " + humanTrigger(p.workflow.trigger)));
-    row("Trigger", trig);
-
-    const sys = el("div", "chips");
-    for (const s of systemsOf(p)) {
-      const c = btn(s, "chip", () => go("system/" + encodeURIComponent(s)));
-      c.title = "See which steps use this system";
-      sys.append(c);
-    }
-    row("Systems", sys);
-
-    const steps = el("div");
-    steps.append(document.createTextNode(stepsOf(p).length + " steps  "));
-    steps.append(btn("View workflow", "link", () => { state.dtab = "workflow"; renderDetail(); }));
-    row("Steps", steps);
-  } else {
-    row("Workflow", el("span", "muted", "No workflow.yaml yet."));
-  }
-  body.append(meta);
-}
-function renderWorkflow(body, p) {
-  const w = p.workflow;
-  const steps = stepsOf(p);
-  const nodes = {};
-  const key = (id) => p.slug + ":" + id;
-
-  const setOpen = (id, open) => {
-    const n = nodes[id];
-    if (!n) return;
-    n.body.hidden = !open;
-    n.chev.textContent = open ? "\u25be" : "\u25b8";
-    n.head.setAttribute("aria-expanded", String(open));
-    if (open) state.open.add(key(id)); else state.open.delete(key(id));
-  };
-
-  const bar = el("div", "toolbar");
-  bar.append(
-    btn("Expand all", "small-btn", () => steps.forEach((s) => setOpen(s.id, true))),
-    btn("Collapse all", "small-btn", () => steps.forEach((s) => setOpen(s.id, false)))
-  );
-  body.append(bar);
-
-  const flow = el("div", "flow");
-  const t = el("div", "node trigger");
-  const human = humanTrigger(w.trigger);
-  t.append(el("div", "small muted", "Trigger"), el("strong", null, w.trigger.type + (human ? " - " + human : "")));
-  if (w.trigger.type === "schedule" && human !== w.trigger.spec) t.append(el("div", "small muted", "cron: " + w.trigger.spec));
-  flow.append(t);
-
-  const names = {};
-  steps.forEach((s) => { names[s.id] = s.name; });
-
-  for (const s of steps) {
-    flow.append(el("div", "arrow", "\u2193"));
-    const node = el("div", "node");
-    const head = el("button", "step-head");
-    head.type = "button";
-    const chev = el("span", "chev", "\u25b8");
-    const title = el("span", "step-title");
-    title.append(el("strong", null, s.name), el("span", "muted small", s.system || ""));
-    head.append(chev, title, badge(s.type));
-
-    const bd = el("div", "step-body");
-    bd.hidden = true;
-    bd.append(el("div", "small", s.notes || "No notes for this step."));
-    const nx = el("div", "small muted");
-    if (s.next && s.next.length) {
-      nx.append(document.createTextNode("Next: "));
-      s.next.forEach((id, i) => {
-        if (i) nx.append(document.createTextNode(", "));
-        nx.append(btn(names[id] || id, "link", () => {
-          setOpen(id, true);
-          const target = nodes[id];
-          if (!target) return;
-          target.node.scrollIntoView({ behavior: "smooth", block: "center" });
-          target.node.classList.add("flash");
-          setTimeout(() => target.node.classList.remove("flash"), 1200);
-        }));
-      });
-    } else {
-      nx.append(document.createTextNode("End of flow"));
-    }
-    bd.append(nx);
-
-    head.addEventListener("click", () => setOpen(s.id, bd.hidden));
-    node.append(head, bd);
-    flow.append(node);
-    nodes[s.id] = { node: node, head: head, body: bd, chev: chev };
-  }
-
-  if (w.outputs && w.outputs.length) {
-    flow.append(el("div", "arrow", "\u2193"));
-    const o = el("div", "node");
-    o.append(el("div", "small muted", "Outputs"));
-    const chips = el("div", "chips");
-    for (const x of w.outputs) chips.append(el("span", "chip", x));
-    o.append(chips);
-    flow.append(o);
-  }
-  body.append(flow);
-  steps.forEach((s) => { if (state.open.has(key(s.id))) setOpen(s.id, true); });
-}
-
-/* ---------- Systems tab ---------- */
-
-function renderSystems(view) {
-  const wrap = el("div", "panel");
-  const q = el("input");
-  q.type = "search";
-  q.placeholder = "Filter systems";
-  q.value = state.sys;
-  q.setAttribute("aria-label", "Filter systems");
-  const grid = el("div", "cards wide");
-
-  const draw = () => {
-    grid.replaceChildren();
-    const f = state.sys.trim().toLowerCase();
-    const list = systemIndex().filter((s) => !f || s.name.toLowerCase().includes(f));
-    if (!list.length) { grid.append(el("p", "muted", "No systems match.")); return; }
-    for (const s of list) {
-      const c = el("div", "card");
-      c.style.cursor = "pointer";
-      c.addEventListener("click", (e) => { if (!e.target.closest("button")) go("system/" + encodeURIComponent(s.name)); });
-      c.append(btn(s.name, "link", () => go("system/" + encodeURIComponent(s.name))));
-      c.append(el("div", "muted small", s.steps + (s.steps === 1 ? " step in " : " steps in ") + s.projects.size + (s.projects.size === 1 ? " project" : " projects")));
-      const chips = el("div", "chips");
-      for (const [slug, title] of s.projects) {
-        chips.append(btn(title, "chip", () => { state.dtab = "workflow"; go("projects/" + encodeURIComponent(slug)); }));
+// While something is running, look again every 1.5 seconds. Otherwise check
+// every 30 seconds so "last run" stays current.
+function schedule() {
+  clearTimeout(timer);
+  const mine = visit;
+  timer = setTimeout(async () => {
+    try {
+      if (!document.hidden) {
+        await screen.refresh();
+        if (lost) { lost = false; showError(""); }
       }
-      c.append(chips);
-      grid.append(c);
+    } catch (e) {
+      if (mine === visit) { lost = true; showError("Lost contact with the hub: " + e.message); }
     }
-  };
-  q.addEventListener("input", () => { state.sys = q.value; draw(); });
-
-  wrap.append(el("p", "muted small", "Every tool or service named in a workflow step, and the projects that use it."), q, grid);
-  view.append(wrap);
-  draw();
+    if (mine === visit) schedule();
+  }, screen.busy() ? 1500 : 30000);
 }
 
-/* ---------- Triggers tab ---------- */
-
-function renderTriggers(view) {
-  const wrap = el("div", "panel");
-  const types = ["all"];
-  for (const p of state.data) { const t = triggerType(p); if (!types.includes(t)) types.push(t); }
-  if (!types.includes(state.trig)) state.trig = "all";
-  const chips = el("div", "chips");
-  const rows = el("div");
-
-  const draw = () => {
-    chips.replaceChildren();
-    for (const t of types) chips.append(btn(t, "chip" + (state.trig === t ? " on" : ""), () => { state.trig = t; draw(); }));
-    rows.replaceChildren();
-    const list = state.data.filter((p) => state.trig === "all" || triggerType(p) === state.trig);
-    if (!list.length) { rows.append(el("p", "muted", "No projects match.")); return; }
-    for (const p of list) {
-      const row = el("div", "trow");
-      row.append(btn(p.title, "link", () => { state.dtab = "workflow"; go("projects/" + encodeURIComponent(p.slug)); }));
-      row.append(badge(triggerType(p)));
-      row.append(el("span", "muted", p.workflow ? humanTrigger(p.workflow.trigger) : "No workflow.yaml yet"));
-      row.append(badge(p.status, p.status));
-      rows.append(row);
-    }
-  };
-
-  wrap.append(el("p", "muted small", "When each project starts, taken from its workflow file. The hub records this but does not run anything yet."), chips, rows);
-  view.append(wrap);
-  draw();
-}
-
-/* ---------- Tag and System pages ---------- */
-
-function renderTag(view) {
-  const tag = state.slug;
-  const list = state.data.filter((p) => (p.tags || []).includes(tag));
-  const wrap = el("div", "panel");
-  const head = el("div", "row");
-  head.append(el("h2", null, "Tag: " + tag), btn("\u2190 All projects", "small-btn", () => go("projects")));
-  wrap.append(head, el("p", "muted", list.length + (list.length === 1 ? " project has" : " projects have") + " this tag."));
-  for (const p of list) {
-    const a = el("a", "item");
-    a.href = "#projects/" + encodeURIComponent(p.slug);
-    const top = el("div", "row");
-    top.append(el("strong", null, p.title), badge(p.status, p.status));
-    a.append(top, el("div", "muted small", p.about));
-    wrap.append(a);
-  }
-  view.append(wrap);
-}
-
-function renderSystem(view) {
-  const name = state.slug;
-  const wrap = el("div", "panel");
-  const head = el("div", "row");
-  head.append(el("h2", null, name), btn("\u2190 All systems", "small-btn", () => go("systems")));
-  const grid = el("div", "cards wide");
-  let steps = 0;
-  let projs = 0;
-  for (const p of state.data) {
-    const hits = stepsOf(p).filter((s) => (s.system || "(unspecified)") === name);
-    if (!hits.length) continue;
-    steps += hits.length;
-    projs++;
-    const card = el("div", "card static");
-    const top = el("div", "row");
-    top.append(btn(p.title, "link", () => { state.dtab = "workflow"; go("projects/" + encodeURIComponent(p.slug)); }), badge(p.status, p.status));
-    const chips = el("div", "chips");
-    for (const s of hits) {
-      chips.append(btn(s.name, "chip", () => {
-        state.dtab = "workflow";
-        state.open.add(p.slug + ":" + s.id);
-        go("projects/" + encodeURIComponent(p.slug));
-      }));
-    }
-    card.append(top, chips);
-    grid.append(card);
-  }
-  const summary = steps
-    ? steps + (steps === 1 ? " step in " : " steps in ") + projs + (projs === 1 ? " project uses" : " projects use") + " this. Click a step to open it."
-    : "No workflow step uses this system.";
-  wrap.append(head, el("p", "muted", summary), grid);
-  view.append(wrap);
-}
-
-/* ---------- start ---------- */
-
-async function init() {
-  const nav = $("nav");
-  for (const [id, label] of TABS) {
-    const a = el("a", null, label);
-    a.href = "#" + id;
-    a.dataset.tab = id;
-    if (id === "projects") a.addEventListener("click", () => { state.filters = { q: "", status: "", kind: "", tag: "" }; setTimeout(route, 0); });
-    nav.append(a);
-  }
+async function route() {
+  const mine = ++visit;
+  clearTimeout(timer);
+  const r = parseHash();
+  document.querySelectorAll("nav a").forEach((a) => {
+    const on = a.dataset.page === (r.page === "activity" ? "activity" : "projects");
+    a.classList.toggle("active", on);
+    if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  });
   try {
-    state.data = await getJSON("/api/projects?full=1");
+    await loadProjects();
+    if (mine !== visit) return;
+    showError("");
+    $("#count").textContent = plural(state.projects.length, "project");
+    const view = $("#view");
+    if (r.page === "project") screen = projectScreen(view, r.slug, r.tab, r.run);
+    else if (r.page === "activity") screen = activityScreen(view);
+    else screen = projectsScreen(view);
+    if (r.page !== "projects") await screen.refresh();
+    if (mine === visit) schedule();
   } catch (e) {
-    const b = $("#error");
-    b.textContent = "Could not load projects: " + e.message;
-    b.hidden = false;
-    return;
+    if (mine === visit) showError("Could not load from the hub: " + e.message);
+  }
+}
+
+function init() {
+  for (const [id, label] of [["projects", "Projects"], ["activity", "Activity"]]) {
+    const a = link("#" + id, null, label);
+    a.dataset.page = id;
+    $("nav").append(a);
   }
   window.addEventListener("hashchange", route);
   route();
