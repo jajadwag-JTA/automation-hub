@@ -26,3 +26,7 @@ dist/
 
 # Local run history and output
 data/
+
+# Company workbooks
+*.xlsm
+*.xls
