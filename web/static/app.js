@@ -175,9 +175,12 @@ function triggerType(p) { return p.workflow ? p.workflow.trigger.type : "none"; 
 function parseHash() {
   let h = "";
   try { h = decodeURIComponent(location.hash.slice(1)); } catch (e) {}
-  const parts = h.split("/");
-  const tab = TABS.some((t) => t[0] === parts[0]) ? parts[0] : "overview";
-  return { tab: tab, slug: parts[1] || "" };
+  const i = h.indexOf("/");
+  const head = i < 0 ? h : h.slice(0, i);
+  const rest = i < 0 ? "" : h.slice(i + 1);
+  if ((head === "tag" || head === "system") && rest) return { tab: head, slug: rest };
+  const tab = TABS.some((t) => t[0] === head) ? head : "overview";
+  return { tab: tab, slug: rest };
 }
 
 function go(hash) {
@@ -193,7 +196,8 @@ function openProjects(extra) {
 function route() {
   const r = parseHash();
   const view = $("#view");
-  const changed = r.tab !== state.tab || !view.firstChild;
+  const detailTab = r.tab === "tag" || r.tab === "system";
+  const changed = r.tab !== state.tab || !view.firstChild || (detailTab && r.slug !== state.slug);
   state.tab = r.tab;
   state.slug = r.slug;
   if (changed) render();
@@ -203,9 +207,10 @@ function route() {
 function render() {
   const view = $("#view");
   view.replaceChildren();
-  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === state.tab));
-  $("#count").textContent = state.data.length + " projects";
-  const views = { overview: renderOverview, projects: renderProjects, systems: renderSystems, triggers: renderTriggers };
+  const navTab = state.tab === "tag" ? "projects" : state.tab === "system" ? "systems" : state.tab;
+  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === navTab));
+  $("#count").textContent = state.data.length + (state.data.length === 1 ? " project" : " projects");
+  const views = { overview: renderOverview, projects: renderProjects, systems: renderSystems, triggers: renderTriggers, tag: renderTag, system: renderSystem };
   views[state.tab](view);
 }
 /* ---------- Overview tab ---------- */
@@ -214,7 +219,15 @@ function statCard(label, value, onclick) {
   const b = el("button", "card");
   b.type = "button";
   b.append(el("div", "num", String(value)), el("div", "muted small", label));
-  b.addEventListener("click", onclick);
+  if (value === 0) {
+    b.disabled = true;
+    b.title = "Nothing here yet";
+    b.style.opacity = "0.5";
+    b.style.cursor = "default";
+    b.style.borderColor = "var(--line)";
+  } else {
+    b.addEventListener("click", onclick);
+  }
   return b;
 }
 
@@ -252,14 +265,14 @@ function renderOverview(view) {
   const tagBox = el("div", "chips");
   const tagKeys = Object.keys(tags).sort();
   if (!tagKeys.length) tagBox.append(el("span", "muted small", "No tags yet."));
-  for (const t of tagKeys) tagBox.append(btn(t + " (" + tags[t] + ")", "chip", () => openProjects({ tag: t })));
+  for (const t of tagKeys) tagBox.append(btn(t + " (" + tags[t] + ")", "chip", () => go("tag/" + encodeURIComponent(t))));
   wrap.append(tagBox);
 
   wrap.append(sectionTitle("Systems used"));
   const sysBox = el("div", "chips");
   const sys = systemIndex();
   if (!sys.length) sysBox.append(el("span", "muted small", "No workflows yet."));
-  for (const s of sys.slice(0, 14)) sysBox.append(btn(s.name, "chip", () => { state.sys = s.name; go("systems"); }));
+  for (const s of sys.slice(0, 14)) sysBox.append(btn(s.name, "chip", () => go("system/" + encodeURIComponent(s.name))));
   wrap.append(sysBox);
 
   view.append(wrap);
@@ -326,7 +339,7 @@ function renderList() {
   }
 
   const shown = applyFilters();
-  $("#count").textContent = shown.length + " of " + state.data.length + " projects";
+  $("#count").textContent = shown.length + " of " + state.data.length + (state.data.length === 1 ? " project" : " projects");
   ul.replaceChildren();
   if (!shown.length) { ul.append(el("li", "muted empty", "No projects match.")); return; }
   for (const p of shown) {
@@ -404,8 +417,8 @@ function renderProjectOverview(body, p) {
 
   const tags = el("div", "chips");
   for (const t of p.tags || []) {
-    const c = btn(t, "chip", () => { state.filters.tag = t; renderList(); });
-    c.title = "Filter the list by this tag";
+    const c = btn(t, "chip", () => go("tag/" + encodeURIComponent(t)));
+    c.title = "See every project with this tag";
     tags.append(c);
   }
   if (!tags.childNodes.length) tags.append(el("span", "muted", "-"));
@@ -414,7 +427,9 @@ function renderProjectOverview(body, p) {
   const links = el("div", "links");
   for (const [name, url] of Object.entries(p.links || {})) {
     if (/^https?:\/\//i.test(url)) {
-      const a = el("a", null, name);
+      const local = /^https?:\/\/(localhost|127\.0\.0\.1)/i.test(url);
+      const a = el("a", null, local ? name + " (local)" : name);
+      if (local) a.title = "Opens only while it is running on this computer";
       a.href = url;
       a.target = "_blank";
       a.rel = "noopener noreferrer";
@@ -433,8 +448,8 @@ function renderProjectOverview(body, p) {
 
     const sys = el("div", "chips");
     for (const s of systemsOf(p)) {
-      const c = btn(s, "chip", () => { state.sys = s; go("systems"); });
-      c.title = "See where this system is used";
+      const c = btn(s, "chip", () => go("system/" + encodeURIComponent(s)));
+      c.title = "See which steps use this system";
       sys.append(c);
     }
     row("Systems", sys);
@@ -548,8 +563,10 @@ function renderSystems(view) {
     const list = systemIndex().filter((s) => !f || s.name.toLowerCase().includes(f));
     if (!list.length) { grid.append(el("p", "muted", "No systems match.")); return; }
     for (const s of list) {
-      const c = el("div", "card static");
-      c.append(el("strong", null, s.name));
+      const c = el("div", "card");
+      c.style.cursor = "pointer";
+      c.addEventListener("click", (e) => { if (!e.target.closest("button")) go("system/" + encodeURIComponent(s.name)); });
+      c.append(btn(s.name, "link", () => go("system/" + encodeURIComponent(s.name))));
       c.append(el("div", "muted small", s.steps + (s.steps === 1 ? " step in " : " steps in ") + s.projects.size + (s.projects.size === 1 ? " project" : " projects")));
       const chips = el("div", "chips");
       for (const [slug, title] of s.projects) {
@@ -597,6 +614,60 @@ function renderTriggers(view) {
   draw();
 }
 
+/* ---------- Tag and System pages ---------- */
+
+function renderTag(view) {
+  const tag = state.slug;
+  const list = state.data.filter((p) => (p.tags || []).includes(tag));
+  const wrap = el("div", "panel");
+  const head = el("div", "row");
+  head.append(el("h2", null, "Tag: " + tag), btn("\u2190 All projects", "small-btn", () => go("projects")));
+  wrap.append(head, el("p", "muted", list.length + (list.length === 1 ? " project has" : " projects have") + " this tag."));
+  for (const p of list) {
+    const a = el("a", "item");
+    a.href = "#projects/" + encodeURIComponent(p.slug);
+    const top = el("div", "row");
+    top.append(el("strong", null, p.title), badge(p.status, p.status));
+    a.append(top, el("div", "muted small", p.about));
+    wrap.append(a);
+  }
+  view.append(wrap);
+}
+
+function renderSystem(view) {
+  const name = state.slug;
+  const wrap = el("div", "panel");
+  const head = el("div", "row");
+  head.append(el("h2", null, name), btn("\u2190 All systems", "small-btn", () => go("systems")));
+  const grid = el("div", "cards wide");
+  let steps = 0;
+  let projs = 0;
+  for (const p of state.data) {
+    const hits = stepsOf(p).filter((s) => (s.system || "(unspecified)") === name);
+    if (!hits.length) continue;
+    steps += hits.length;
+    projs++;
+    const card = el("div", "card static");
+    const top = el("div", "row");
+    top.append(btn(p.title, "link", () => { state.dtab = "workflow"; go("projects/" + encodeURIComponent(p.slug)); }), badge(p.status, p.status));
+    const chips = el("div", "chips");
+    for (const s of hits) {
+      chips.append(btn(s.name, "chip", () => {
+        state.dtab = "workflow";
+        state.open.add(p.slug + ":" + s.id);
+        go("projects/" + encodeURIComponent(p.slug));
+      }));
+    }
+    card.append(top, chips);
+    grid.append(card);
+  }
+  const summary = steps
+    ? steps + (steps === 1 ? " step in " : " steps in ") + projs + (projs === 1 ? " project uses" : " projects use") + " this. Click a step to open it."
+    : "No workflow step uses this system.";
+  wrap.append(head, el("p", "muted", summary), grid);
+  view.append(wrap);
+}
+
 /* ---------- start ---------- */
 
 async function init() {
@@ -605,6 +676,7 @@ async function init() {
     const a = el("a", null, label);
     a.href = "#" + id;
     a.dataset.tab = id;
+    if (id === "projects") a.addEventListener("click", () => { state.filters = { q: "", status: "", kind: "", tag: "" }; setTimeout(route, 0); });
     nav.append(a);
   }
   try {
